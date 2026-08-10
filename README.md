@@ -18,6 +18,9 @@ GET /health
 requeued for the remaining workers. If every proxy is exhausted, unprocessed jobs are returned
 with `status: "skipped"` instead of hanging the request.
 
+The container disables Uvicorn access logs because the `proxies` query parameter contains
+credentials. JobSpy application and error logs remain enabled without emitting request URLs.
+
 ## Tests
 
 ```bash
