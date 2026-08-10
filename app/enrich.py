@@ -88,7 +88,6 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
 
     results: list[EnrichResult] = []
     results_lock = asyncio.Lock()
-    alive_count = asyncio.Semaphore(len(proxies))
     dead_proxies: dict[str, str] = {}
 
     async def worker(proxy_idx: int, proxy: ProxyConfig):
@@ -98,10 +97,7 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
             follow_redirects=False,
         ) as client:
             while True:
-                try:
-                    job = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
+                job = await queue.get()
 
                 job_id = job.get("job_id", "")
                 url = job.get("url", LINKEDIN_JOB_URL.format(job_id=job_id))
@@ -123,7 +119,6 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                     logger.warning("Proxy %s dead: %s. Re-queuing job %s", proxy.host, e, job_id)
                     await queue.put(job)
                     dead_proxies[proxy.host] = e.reason
-                    alive_count.acquire()
                     return
 
                 except Exception as e:
@@ -131,8 +126,32 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                     async with results_lock:
                         results.append(EnrichResult(job_id=job_id, url=url, status="error", error=str(e)))
 
-    tasks = [asyncio.create_task(worker(i, p)) for i, p in enumerate(proxies)]
-    await asyncio.gather(*tasks)
+                finally:
+                    queue.task_done()
+
+    worker_tasks = {asyncio.create_task(worker(i, p)) for i, p in enumerate(proxies)}
+    pending_workers = set(worker_tasks)
+    queue_done = asyncio.create_task(queue.join())
+
+    try:
+        while pending_workers:
+            done, _ = await asyncio.wait(
+                pending_workers | {queue_done},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            finished_workers = done & pending_workers
+            for task in finished_workers:
+                task.result()
+            pending_workers -= finished_workers
+
+            if queue_done in done:
+                break
+    finally:
+        if not queue_done.done():
+            queue_done.cancel()
+        for task in pending_workers:
+            task.cancel()
+        await asyncio.gather(queue_done, *worker_tasks, return_exceptions=True)
 
     skipped_jobs = []
     while not queue.empty():
