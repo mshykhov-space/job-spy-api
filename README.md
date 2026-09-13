@@ -1,37 +1,29 @@
-# job-spy-api
+# Job Spy API
 
-FastAPI wrapper around [python-jobspy](https://github.com/speedyapply/JobSpy). Scrapes LinkedIn, Indeed, Glassdoor, Google Jobs and more.
+FastAPI wrapper around [python-jobspy](https://github.com/speedyapply/JobSpy) for searching job boards and enriching individual LinkedIn job pages through caller-supplied proxies.
 
-## Usage
+`GET /jobs` forwards supported search parameters to python-jobspy. `POST /jobs/enrich` processes a batch with one worker per proxy, requeues work after a proxy failure, and returns skipped jobs when every proxy is exhausted. `GET /health` returns the service status.
 
-```bash
-docker run -p 8000:8000 mshykhov/job-spy-api
+## Run locally
+
+Requires Python 3.12 or Docker.
+
+```sh
+docker build -t job-spy-api .
+docker run --rm -p 8000:8000 job-spy-api
 ```
 
-```
-GET /jobs?site=linkedin&search_term=kotlin+developer&location=Europe&is_remote=true&hours_old=1&results_wanted=50&proxies=user:pass@host:port
-POST /jobs/enrich
-GET /health
-```
+The service accepts proxy credentials through `DEFAULT_PROXIES` or the request. Do not expose them in URLs, logs, or committed environment files.
 
-`POST /jobs/enrich` runs one worker per proxy. Jobs from a dead or rate-limited proxy are
-requeued for the remaining workers. If every proxy is exhausted, unprocessed jobs are returned
-with `status: "skipped"` instead of hanging the request.
+## Test
 
-The container disables Uvicorn access logs because the `proxies` query parameter contains
-credentials. JobSpy application and error logs remain enabled without emitting request URLs.
-
-## Tests
-
-```bash
+```sh
 pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-## Release
+Tests mock network access.
 
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
+## License
 
-Builds and pushes `mshykhov/job-spy-api:latest` to Docker Hub.
+[MIT](LICENSE)
