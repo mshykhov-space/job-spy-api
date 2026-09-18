@@ -1,4 +1,4 @@
-python-jobspy @ https://github.com/Bunsly/JobSpy/archive/main.tar.gz
+python-jobspy @ https://github.com/Bunsly/JobSpy/archive/fda080a373e8226f3fd60635323f5da9af9892b1.tar.gz
 fastapi>=0.115.0
 uvicorn>=0.34.0
 beautifulsoup4>=4.12.0
