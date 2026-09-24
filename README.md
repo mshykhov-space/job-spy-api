@@ -28,6 +28,9 @@ Requires Python 3.12 or Docker.
 ```sh
 docker build -t job-spy-api .
 docker run --rm -p 8000:8000 job-spy-api
+
+# Published image
+docker run --rm -p 8000:8000 ghcr.io/mshykhov-space/job-spy-api:latest
 ```
 
 The service accepts proxy credentials through `DEFAULT_PROXIES` or the POST request body. The legacy GET query is retained for compatibility. Do not expose credentials in URLs, logs, or committed environment files.
