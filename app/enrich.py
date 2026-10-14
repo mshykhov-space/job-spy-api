@@ -17,9 +17,18 @@ logger = logging.getLogger(__name__)
 
 LINKEDIN_JOB_URL = "https://www.linkedin.com/jobs/view/{job_id}"
 REQUEST_TIMEOUT = 30
-DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60
+FALLBACK_RATE_LIMIT_COOLDOWNS_SECONDS = (900, 1800, 3600)
 _POSTED_TIME_RE = re.compile(r"Posted\s+(\d{1,2}:\d{2}:\d{2} [AP]M)")
-_proxy_cooldowns: dict[str, float] = {}
+
+
+@dataclass
+class _ProxyCooldownState:
+    deadline: float = 0
+    fallback_count: int = 0
+    generation: int = 0
+
+
+_proxy_cooldowns: dict[str, _ProxyCooldownState] = {}
 _proxy_cooldown_lock = threading.Lock()
 
 
@@ -124,12 +133,15 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                 date_posted = job.get("date_posted", "")
 
                 try:
-                    if proxy.host in _proxy_cooldown_snapshot([proxy]):
+                    attempt_generation = _begin_proxy_attempt(proxy.host)
+                    if attempt_generation is None:
                         await queue.put(job)
                         logger.info("Proxy %s is cooling down; re-queuing job %s", proxy.host, job_id)
                         return
 
                     result = await _fetch_job_detail(client, url, job_id, proxy.fingerprint, date_posted)
+                    if result.status == "success":
+                        _record_proxy_success(proxy.host, attempt_generation)
                     async with results_lock:
                         results.append(result)
 
@@ -141,12 +153,7 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
 
                 except _ProxyDeadError as e:
                     if e.reason == "rate_limited":
-                        cooldown = (
-                            DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-                            if e.retry_after_seconds is None
-                            else e.retry_after_seconds
-                        )
-                        _cool_proxy(proxy.host, cooldown)
+                        cooldown = _record_proxy_rate_limit(proxy.host, e.retry_after_seconds)
                         logger.warning(
                             "Proxy %s dead: rate_limited (temporary cooldown %.1fs). Re-queuing job %s",
                             proxy.host,
@@ -432,9 +439,9 @@ def _compute_stats(
     )
 
 
-def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float:
+def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
     if value is None:
-        return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+        return None
 
     delay: float
     try:
@@ -451,30 +458,56 @@ def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> flo
                 current_time = current_time.replace(tzinfo=timezone.utc)
             delay = (retry_at - current_time).total_seconds()
         except (TypeError, ValueError, OverflowError):
-            return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+            return None
 
     return max(delay, 0.0)
 
 
-def _cool_proxy(host: str, duration_seconds: float) -> None:
-    if not math.isfinite(duration_seconds):
-        duration_seconds = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+def _record_proxy_rate_limit(host: str, retry_after_seconds: float | None) -> float:
     with _proxy_cooldown_lock:
-        deadline = time.monotonic() + max(duration_seconds, 0.0)
-        _proxy_cooldowns[host] = max(_proxy_cooldowns.get(host, 0.0), deadline)
+        state = _proxy_cooldowns.setdefault(host, _ProxyCooldownState())
+        if retry_after_seconds is None:
+            state.fallback_count = min(
+                state.fallback_count + 1,
+                len(FALLBACK_RATE_LIMIT_COOLDOWNS_SECONDS),
+            )
+            cooldown = FALLBACK_RATE_LIMIT_COOLDOWNS_SECONDS[state.fallback_count - 1]
+        else:
+            cooldown = max(retry_after_seconds, 0.0)
+
+        now = time.monotonic()
+        state.deadline = max(state.deadline, now + cooldown)
+        state.generation += 1
+        return max(0.0, state.deadline - now)
+
+
+def _begin_proxy_attempt(host: str) -> int | None:
+    with _proxy_cooldown_lock:
+        state = _proxy_cooldowns.setdefault(host, _ProxyCooldownState())
+        if state.deadline > time.monotonic():
+            return None
+        return state.generation
+
+
+def _record_proxy_success(host: str, attempt_generation: int) -> bool:
+    with _proxy_cooldown_lock:
+        state = _proxy_cooldowns.setdefault(host, _ProxyCooldownState())
+        if state.generation != attempt_generation:
+            return False
+        state.deadline = 0
+        state.fallback_count = 0
+        state.generation += 1
+        return True
 
 
 def _proxy_cooldown_snapshot(proxies: list[ProxyConfig]) -> dict[str, float]:
     now = time.monotonic()
     hosts = {proxy.host for proxy in proxies}
     with _proxy_cooldown_lock:
-        for host, deadline in list(_proxy_cooldowns.items()):
-            if deadline <= now:
-                del _proxy_cooldowns[host]
         return {
-            host: round(_proxy_cooldowns[host] - now, 1)
+            host: round(_proxy_cooldowns[host].deadline - now, 1)
             for host in hosts
-            if host in _proxy_cooldowns
+            if host in _proxy_cooldowns and _proxy_cooldowns[host].deadline > now
         }
 
 
