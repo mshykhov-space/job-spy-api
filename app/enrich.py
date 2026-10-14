@@ -1,10 +1,13 @@
 import asyncio
 import logging
+import math
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 from bs4 import BeautifulSoup
@@ -14,7 +17,10 @@ logger = logging.getLogger(__name__)
 
 LINKEDIN_JOB_URL = "https://www.linkedin.com/jobs/view/{job_id}"
 REQUEST_TIMEOUT = 30
+DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60
 _POSTED_TIME_RE = re.compile(r"Posted\s+(\d{1,2}:\d{2}:\d{2} [AP]M)")
+_proxy_cooldowns: dict[str, float] = {}
+_proxy_cooldown_lock = threading.Lock()
 
 
 @dataclass
@@ -58,6 +64,7 @@ class EnrichStats:
     proxies_total: int = 0
     proxies_alive: int = 0
     proxy_deaths: dict[str, str] = field(default_factory=dict)
+    cooling_down: dict[str, float] = field(default_factory=dict)
     duration_seconds: float = 0
 
     def to_dict(self) -> dict:
@@ -70,6 +77,8 @@ class EnrichStats:
         proxies: dict = {"alive": self.proxies_alive}
         if self.proxy_deaths:
             proxies["dead"] = self.proxy_deaths
+        if self.cooling_down:
+            proxies["cooling_down"] = self.cooling_down
         d["proxies"] = proxies
         d["duration_seconds"] = self.duration_seconds
         return d
@@ -81,6 +90,16 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
     proxies = [ProxyConfig(url=p["url"], fingerprint=p.get("fingerprint", {})) for p in request.proxies]
     if not proxies:
         return _empty_response(request.jobs, "No proxies provided")
+
+    cooling_down = _proxy_cooldown_snapshot(proxies)
+    active_proxies = [proxy for proxy in proxies if proxy.host not in cooling_down]
+    if not active_proxies:
+        response = _empty_response(request.jobs, "All proxies exhausted")
+        response["stats"]["proxies"] = {
+            "alive": 0,
+            "cooling_down": cooling_down,
+        }
+        return response
 
     queue: asyncio.Queue[dict] = asyncio.Queue()
     for job in request.jobs:
@@ -105,6 +124,11 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                 date_posted = job.get("date_posted", "")
 
                 try:
+                    if proxy.host in _proxy_cooldown_snapshot([proxy]):
+                        await queue.put(job)
+                        logger.info("Proxy %s is cooling down; re-queuing job %s", proxy.host, job_id)
+                        return
+
                     result = await _fetch_job_detail(client, url, job_id, proxy.fingerprint, date_posted)
                     async with results_lock:
                         results.append(result)
@@ -116,7 +140,21 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                         await asyncio.sleep(2)
 
                 except _ProxyDeadError as e:
-                    logger.warning("Proxy %s dead: %s. Re-queuing job %s", proxy.host, e, job_id)
+                    if e.reason == "rate_limited":
+                        cooldown = (
+                            DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+                            if e.retry_after_seconds is None
+                            else e.retry_after_seconds
+                        )
+                        _cool_proxy(proxy.host, cooldown)
+                        logger.warning(
+                            "Proxy %s dead: rate_limited (temporary cooldown %.1fs). Re-queuing job %s",
+                            proxy.host,
+                            cooldown,
+                            job_id,
+                        )
+                    else:
+                        logger.warning("Proxy %s dead: %s. Re-queuing job %s", proxy.host, e, job_id)
                     await queue.put(job)
                     dead_proxies[proxy.host] = e.reason
                     return
@@ -129,7 +167,7 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
                 finally:
                     queue.task_done()
 
-    worker_tasks = {asyncio.create_task(worker(i, p)) for i, p in enumerate(proxies)}
+    worker_tasks = {asyncio.create_task(worker(i, p)) for i, p in enumerate(active_proxies)}
     pending_workers = set(worker_tasks)
     queue_done = asyncio.create_task(queue.join())
 
@@ -166,7 +204,14 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
         )
     results.extend(skipped_jobs)
 
-    stats = _compute_stats(results, len(proxies), dead_proxies, time.monotonic() - start_time)
+    current_cooldowns = _proxy_cooldown_snapshot(proxies)
+    stats = _compute_stats(
+        results,
+        len(proxies),
+        dead_proxies,
+        time.monotonic() - start_time,
+        cooling_down=current_cooldowns,
+    )
 
     return {
         "results": [_result_to_dict(r) for r in results],
@@ -175,9 +220,10 @@ async def enrich_jobs(request: EnrichRequest) -> dict:
 
 
 class _ProxyDeadError(Exception):
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", retry_after_seconds: float | None = None):
         self.reason = reason
         self.detail = detail
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(f"{reason}: {detail}" if detail else reason)
 
 
@@ -200,7 +246,10 @@ async def _fetch_job_detail(
         raise _ProxyDeadError("connect_error", str(e))
 
     if response.status_code == 429:
-        raise _ProxyDeadError("rate_limited")
+        raise _ProxyDeadError(
+            "rate_limited",
+            retry_after_seconds=_parse_retry_after(response.headers.get("retry-after")),
+        )
 
     if response.status_code in (301, 302, 303, 307, 308):
         location = response.headers.get("location", "")
@@ -359,6 +408,7 @@ def _compute_stats(
     total_proxies: int,
     dead_proxies: dict[str, str],
     duration: float,
+    cooling_down: dict[str, float] | None = None,
 ) -> EnrichStats:
     failed: dict[str, int] = {}
     success = 0
@@ -369,15 +419,63 @@ def _compute_stats(
             reason = r.error or r.status
             failed[reason] = failed.get(reason, 0) + 1
 
+    cooling_down = cooling_down or {}
     return EnrichStats(
         total=len(results),
         success=success,
         failed=failed,
         proxies_total=total_proxies,
-        proxies_alive=total_proxies - len(dead_proxies),
+        proxies_alive=total_proxies - len(set(dead_proxies) | set(cooling_down)),
         proxy_deaths=dead_proxies,
+        cooling_down=cooling_down,
         duration_seconds=round(duration, 1),
     )
+
+
+def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float:
+    if value is None:
+        return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+    delay: float
+    try:
+        delay = float(value.strip())
+        if not math.isfinite(delay):
+            raise ValueError("Retry-After must be finite")
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            current_time = now or datetime.now(timezone.utc)
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+            delay = (retry_at - current_time).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+    return max(delay, 0.0)
+
+
+def _cool_proxy(host: str, duration_seconds: float) -> None:
+    if not math.isfinite(duration_seconds):
+        duration_seconds = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    with _proxy_cooldown_lock:
+        deadline = time.monotonic() + max(duration_seconds, 0.0)
+        _proxy_cooldowns[host] = max(_proxy_cooldowns.get(host, 0.0), deadline)
+
+
+def _proxy_cooldown_snapshot(proxies: list[ProxyConfig]) -> dict[str, float]:
+    now = time.monotonic()
+    hosts = {proxy.host for proxy in proxies}
+    with _proxy_cooldown_lock:
+        for host, deadline in list(_proxy_cooldowns.items()):
+            if deadline <= now:
+                del _proxy_cooldowns[host]
+        return {
+            host: round(_proxy_cooldowns[host] - now, 1)
+            for host in hosts
+            if host in _proxy_cooldowns
+        }
 
 
 def _result_to_dict(r: EnrichResult) -> dict:

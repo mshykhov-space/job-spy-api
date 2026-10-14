@@ -1,8 +1,17 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
-from app.enrich import EnrichRequest, EnrichResult, _ProxyDeadError, enrich_jobs
+from app.enrich import (
+    EnrichRequest,
+    EnrichResult,
+    _ProxyDeadError,
+    _fetch_job_detail,
+    _parse_retry_after,
+    enrich_jobs,
+)
 
 
 class _FakeAsyncClient:
@@ -29,6 +38,12 @@ class _FailingRequeueQueue(asyncio.Queue):
 
 
 class EnrichJobsTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        from app import enrich
+
+        with enrich._proxy_cooldown_lock:
+            enrich._proxy_cooldowns.clear()
+
     async def test_requeued_job_is_processed_by_waiting_proxy(self) -> None:
         async def fetch_job(
             client: _FakeAsyncClient,
@@ -61,6 +76,234 @@ class EnrichJobsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["stats"]["success"], 1)
         self.assertEqual(response["stats"]["proxies"]["alive"], 1)
         self.assertEqual(response["results"][0]["status"], "success")
+
+    async def test_rate_limited_proxy_is_skipped_by_later_request(self) -> None:
+        calls: list[str] = []
+
+        async def fetch_job(
+            client: _FakeAsyncClient,
+            url: str,
+            job_id: str,
+            _fingerprint: dict[str, str],
+            _date_posted: str,
+        ) -> EnrichResult:
+            calls.append(client.proxy)
+            if client.proxy.endswith("proxy-one:8000"):
+                raise _ProxyDeadError("rate_limited", retry_after_seconds=120)
+            return EnrichResult(job_id=job_id, url=url, status="success", data={"ok": True})
+
+        first = EnrichRequest(
+            jobs=[{"job_id": "42", "url": "https://example.com/jobs/42"}],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        second = EnrichRequest(
+            jobs=[{"job_id": "43", "url": "https://example.com/jobs/43"}],
+            proxies=[
+                {"url": "user:pass@proxy-one:8000"},
+                {"url": "user:pass@proxy-two:8000"},
+            ],
+            delay_min=0,
+            delay_max=0,
+        )
+
+        with (
+            patch("app.enrich.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.enrich._fetch_job_detail", fetch_job),
+        ):
+            first_response = await asyncio.wait_for(enrich_jobs(first), timeout=1)
+            second_response = await asyncio.wait_for(enrich_jobs(second), timeout=1)
+
+        self.assertEqual(first_response["results"][0]["status"], "skipped")
+        self.assertEqual(first_response["stats"]["proxies"]["dead"]["proxy-one:8000"], "rate_limited")
+        self.assertIn("proxy-one:8000", second_response["stats"]["proxies"]["cooling_down"])
+        self.assertEqual(second_response["stats"]["success"], 1)
+        self.assertEqual(calls.count("http://user:pass@proxy-one:8000"), 1)
+        self.assertTrue(calls[-1].endswith("proxy-two:8000"))
+
+    async def test_all_cooling_proxies_are_skipped_without_a_fetch(self) -> None:
+        calls = 0
+
+        async def fetch_job(*_: object) -> EnrichResult:
+            nonlocal calls
+            calls += 1
+            raise _ProxyDeadError("rate_limited", retry_after_seconds=3600)
+
+        request = EnrichRequest(
+            jobs=[{"job_id": "42", "url": "https://example.com/jobs/42"}],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        with (
+            patch("app.enrich.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.enrich._fetch_job_detail", fetch_job),
+        ):
+            first_response = await asyncio.wait_for(enrich_jobs(request), timeout=1)
+            second_response = await asyncio.wait_for(enrich_jobs(request), timeout=1)
+
+        self.assertEqual(first_response["stats"]["proxies"]["cooling_down"]["proxy-one:8000"], 3600)
+        self.assertEqual(second_response["results"][0]["status"], "skipped")
+        self.assertEqual(second_response["stats"]["proxies"]["alive"], 0)
+        self.assertEqual(calls, 1)
+
+    async def test_expired_cooldown_allows_proxy_to_resume(self) -> None:
+        from app import enrich
+
+        calls = 0
+
+        async def fetch_job(*args: object) -> EnrichResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _ProxyDeadError("rate_limited", retry_after_seconds=120)
+            return EnrichResult(job_id="42", url="https://example.com/jobs/42", status="success")
+
+        request = EnrichRequest(
+            jobs=[{"job_id": "42", "url": "https://example.com/jobs/42"}],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        with (
+            patch("app.enrich.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.enrich._fetch_job_detail", fetch_job),
+        ):
+            first_response = await asyncio.wait_for(enrich_jobs(request), timeout=1)
+            with enrich._proxy_cooldown_lock:
+                enrich._proxy_cooldowns["proxy-one:8000"] = enrich.time.monotonic() - 1
+            second_response = await asyncio.wait_for(enrich_jobs(request), timeout=1)
+
+        self.assertEqual(first_response["results"][0]["status"], "skipped")
+        self.assertEqual(second_response["stats"]["success"], 1)
+        self.assertEqual(calls, 2)
+
+    async def test_cancellation_does_not_leave_worker_or_queue_hanging(self) -> None:
+        entered_fetch = asyncio.Event()
+        release_fetch = asyncio.Event()
+
+        async def fetch_job(*_: object) -> EnrichResult:
+            entered_fetch.set()
+            await release_fetch.wait()
+            return EnrichResult(job_id="42", url="https://example.com/jobs/42", status="success")
+
+        request = EnrichRequest(
+            jobs=[{"job_id": "42", "url": "https://example.com/jobs/42"}],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        with (
+            patch("app.enrich.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.enrich._fetch_job_detail", fetch_job),
+        ):
+            task = asyncio.create_task(enrich_jobs(request))
+            await asyncio.wait_for(entered_fetch.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+            release_fetch.set()
+            response = await asyncio.wait_for(enrich_jobs(request), timeout=1)
+
+        self.assertEqual(response["stats"]["success"], 1)
+
+    async def test_worker_stops_fetching_after_overlapping_request_cools_proxy(self) -> None:
+        first_job_started = asyncio.Event()
+        continue_first_job = asyncio.Event()
+        calls: list[str] = []
+
+        async def fetch_job(
+            _client: _FakeAsyncClient,
+            _url: str,
+            job_id: str,
+            _fingerprint: dict[str, str],
+            _date_posted: str,
+        ) -> EnrichResult:
+            calls.append(job_id)
+            if job_id == "42":
+                first_job_started.set()
+                await continue_first_job.wait()
+                return EnrichResult(job_id=job_id, url=f"https://example.com/jobs/{job_id}", status="success")
+            if job_id == "43":
+                raise _ProxyDeadError("rate_limited", retry_after_seconds=3600)
+            return EnrichResult(job_id=job_id, url=f"https://example.com/jobs/{job_id}", status="success")
+
+        first_request = EnrichRequest(
+            jobs=[
+                {"job_id": "42", "url": "https://example.com/jobs/42"},
+                {"job_id": "44", "url": "https://example.com/jobs/44"},
+            ],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        second_request = EnrichRequest(
+            jobs=[{"job_id": "43", "url": "https://example.com/jobs/43"}],
+            proxies=[{"url": "user:pass@proxy-one:8000"}],
+            delay_min=0,
+            delay_max=0,
+        )
+        with (
+            patch("app.enrich.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.enrich._fetch_job_detail", fetch_job),
+        ):
+            first_task = asyncio.create_task(enrich_jobs(first_request))
+            await asyncio.wait_for(first_job_started.wait(), timeout=1)
+            second_response = await asyncio.wait_for(enrich_jobs(second_request), timeout=1)
+            continue_first_job.set()
+            first_response = await asyncio.wait_for(first_task, timeout=1)
+
+        self.assertEqual(second_response["results"][0]["status"], "skipped")
+        self.assertNotIn("44", calls)
+        self.assertEqual({result["status"] for result in first_response["results"]}, {"success", "skipped"})
+
+    def test_concurrent_cooldown_updates_keep_the_latest_deadline(self) -> None:
+        from app import enrich
+
+        enrich._cool_proxy("proxy-one:8000", 3600)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            updates = [
+                executor.submit(enrich._cool_proxy, "proxy-one:8000", 120),
+                executor.submit(enrich._cool_proxy, "proxy-one:8000", 180),
+            ]
+            for update in updates:
+                update.result()
+
+        remaining = enrich._proxy_cooldown_snapshot(
+            [enrich.ProxyConfig(url="user:pass@proxy-one:8000")]
+        )["proxy-one:8000"]
+        self.assertGreater(remaining, 3590)
+
+    def test_retry_after_supports_seconds_and_http_date(self) -> None:
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(_parse_retry_after("120", now=now), 120)
+        self.assertEqual(_parse_retry_after("Wed, 14 Oct 2026 12:02:00 GMT", now=now), 120)
+        self.assertEqual(_parse_retry_after("Wed, 14 Oct 2026 11:59:00 GMT", now=now), 0)
+        self.assertEqual(_parse_retry_after("invalid", now=now), 60)
+        self.assertEqual(_parse_retry_after(None, now=now), 60)
+        self.assertEqual(_parse_retry_after("3600", now=now), 3600)
+
+    async def test_429_response_header_is_passed_into_proxy_cooldown(self) -> None:
+        class _Response:
+            status_code = 429
+            headers = {"retry-after": "120"}
+
+        class _Client:
+            async def get(self, *_: object, **__: object) -> _Response:
+                return _Response()
+
+        with self.assertRaises(_ProxyDeadError) as raised:
+            await _fetch_job_detail(
+                _Client(),
+                "https://example.com/jobs/42",
+                "42",
+                {},
+            )
+
+        self.assertEqual(raised.exception.reason, "rate_limited")
+        self.assertEqual(raised.exception.retry_after_seconds, 120)
 
     async def test_all_dead_proxies_return_skipped_jobs_without_hanging(self) -> None:
         async def fetch_job(*_: object) -> EnrichResult:
